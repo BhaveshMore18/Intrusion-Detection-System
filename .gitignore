@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Generated data & trained model artifacts (regeneratable via
+# data/generate_dataset.py and src/train.py -- keep the repo lightweight)
+data/dataset.csv
+models/*.npz
+models/metrics.json
+models/training_report.png
+
+# Runtime
+dashboard/_uploads/
+*.log
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/

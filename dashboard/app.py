@@ -1,0 +1,184 @@
+"""
+dashboard/app.py
+
+Flask web dashboard for the Intrusion Detection System.
+
+- Upload a file -> it's run through the feature-extraction + DL pipeline
+  -> verdict, confidence, and the individual feature readings are shown.
+- A running "recent scans" feed and live counters (files scanned,
+  malicious found, avg confidence) update after every scan.
+- A model-performance panel surfaces the metrics/plot produced by
+  src/train.py, so non-technical stakeholders can see how the model
+  was validated, not just trust a black box.
+
+Run with:
+    python dashboard/app.py
+then open http://localhost:5000
+"""
+
+import json
+import os
+import sys
+import time
+import uuid
+
+from flask import Flask, jsonify, render_template, request, send_from_directory
+from werkzeug.utils import secure_filename
+
+ROOT = os.path.join(os.path.dirname(__file__), "..")
+sys.path.insert(0, os.path.join(ROOT, "src"))
+
+from feature_extraction import extract_features_dict, extract_features  # noqa: E402
+from model import DeepNeuralNetwork  # noqa: E402
+from scaler import StandardScaler  # noqa: E402
+
+MODELS_DIR = os.path.join(ROOT, "models")
+UPLOAD_DIR = os.path.join(ROOT, "dashboard", "_uploads")
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+
+app = Flask(__name__)
+app.config["MAX_CONTENT_LENGTH"] = 100 * 1024 * 1024  # 100 MB upload cap
+
+# ---- in-memory pipeline + scan history (fine for a demo/portfolio app;
+#      swap for a DB if this ever needs to be multi-user/persistent) ----
+_model = None
+_scaler = None
+_scan_history = []  # most-recent-first
+
+
+def get_pipeline():
+    global _model, _scaler
+    if _model is None or _scaler is None:
+        model_path = os.path.join(MODELS_DIR, "ids_model.npz")
+        scaler_path = os.path.join(MODELS_DIR, "scaler.npz")
+        if not os.path.exists(model_path):
+            return None, None
+        _model = DeepNeuralNetwork.load(model_path)
+        _scaler = StandardScaler.load(scaler_path)
+    return _model, _scaler
+
+
+def load_metrics():
+    metrics_path = os.path.join(MODELS_DIR, "metrics.json")
+    if not os.path.exists(metrics_path):
+        return None
+    with open(metrics_path) as f:
+        return json.load(f)
+
+
+@app.route("/")
+def index():
+    metrics = load_metrics()
+    model_ready = metrics is not None
+    return render_template("index.html", model_ready=model_ready, metrics=metrics)
+
+
+@app.route("/api/scan", methods=["POST"])
+def api_scan():
+    model, scaler = get_pipeline()
+    if model is None:
+        return jsonify({"error": "No trained model found. Run `python src/train.py` first."}), 400
+
+    if "file" not in request.files:
+        return jsonify({"error": "No file uploaded."}), 400
+
+    file = request.files["file"]
+    if file.filename == "":
+        return jsonify({"error": "Empty filename."}), 400
+
+    safe_name = secure_filename(file.filename)
+    unique_name = f"{uuid.uuid4().hex}_{safe_name}"
+    save_path = os.path.join(UPLOAD_DIR, unique_name)
+    file.save(save_path)
+
+    try:
+        features = extract_features(save_path).reshape(1, -1)
+        feature_readings = extract_features_dict(save_path)
+        features_scaled = scaler.transform(features)
+        probability = float(model.predict_proba(features_scaled)[0])
+        label = "malicious" if probability >= 0.5 else "benign"
+
+        record = {
+            "id": uuid.uuid4().hex[:8],
+            "filename": safe_name,
+            "label": label,
+            "confidence": round(probability * 100, 2),
+            "size_bytes": int(feature_readings["file_size"]),
+            "entropy": round(feature_readings["byte_entropy"], 3),
+            "is_pe": bool(feature_readings["is_pe"]),
+            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        _scan_history.insert(0, record)
+        del _scan_history[200:]  # cap history so memory doesn't grow unbounded
+
+        return jsonify({"result": record, "features": feature_readings})
+    finally:
+        # Don't retain uploaded files on disk after analysis
+        try:
+            os.remove(save_path)
+        except OSError:
+            pass
+
+
+@app.route("/api/history")
+def api_history():
+    total = len(_scan_history)
+    malicious = sum(1 for r in _scan_history if r["label"] == "malicious")
+    avg_conf = round(sum(r["confidence"] for r in _scan_history) / total, 2) if total else 0
+    return jsonify({
+        "scans": _scan_history[:50],
+        "stats": {
+            "total_scans": total,
+            "malicious_found": malicious,
+            "benign_found": total - malicious,
+            "avg_confidence": avg_conf,
+        },
+    })
+
+
+@app.route("/api/metrics")
+def api_metrics():
+    metrics = load_metrics()
+    if metrics is None:
+        return jsonify({"error": "No metrics found. Run `python src/train.py` first."}), 404
+    return jsonify(metrics)
+
+
+@app.route("/models/<path:filename>")
+def model_assets(filename):
+    """Serves the training_report.png plot generated by train.py."""
+    return send_from_directory(MODELS_DIR, filename)
+
+
+# ---- Error handlers: Flask's default error pages are HTML, which breaks
+#      the dashboard's fetch().json() calls with a confusing parse error.
+#      Force every error response from this app to be JSON instead. ----
+
+@app.errorhandler(413)
+def handle_too_large(e):
+    max_mb = app.config["MAX_CONTENT_LENGTH"] // (1024 * 1024)
+    return jsonify({"error": f"File is too large — the limit is {max_mb} MB."}), 413
+
+
+@app.errorhandler(404)
+def handle_not_found(e):
+    return jsonify({"error": "Not found."}), 404
+
+
+@app.errorhandler(500)
+def handle_server_error(e):
+    return jsonify({"error": "Internal server error while analyzing the file."}), 500
+
+
+@app.errorhandler(Exception)
+def handle_unexpected(e):
+    # Catch-all so a bug in feature extraction / scan handling never leaks
+    # an HTML traceback page to the dashboard's fetch() call.
+    app.logger.exception("Unhandled error")
+    return jsonify({"error": f"Unexpected error: {e}"}), 500
+
+
+if __name__ == "__main__":
+    # debug=False avoids the auto-reloader treating scanned files landing in
+    # dashboard/_uploads/ as a source-code change and restarting mid-request.
+    app.run(debug=False, host="0.0.0.0", port=5000)
